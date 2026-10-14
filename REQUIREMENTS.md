@@ -1,50 +1,125 @@
-### The Logic: Why a GitHub App?
+# Software Requirement Specification (SRS)
 
-Before clicking through configuration screens, it is essential to understand *why* we are building a **GitHub App** instead of using a standard personal access token or an OAuth app.
+## Project Title: ReviewForge
 
-* **Bot Identity & Permissions:** A GitHub App acts as its own distinct automated entity (a bot user). Instead of borrowing your personal account permissions, it has its own tightly scoped permissions (e.g., *only* read code and write PR comments), which is a crucial security best practice in enterprise software.
-* **Installation Model:** Unlike OAuth apps where a user grants access to their entire account, GitHub Apps can be installed granularly on specific repositories or organizations. This mirrors how real-world enterprise tooling (like Datadog, SonarQube, or GitHub Actions) operates.
-* **Webhook Architecture:** GitHub Apps natively subscribe to repository events at scale, using cryptographic signatures (HMAC) to ensure that payloads genuinely originate from GitHub and haven't been tampered with.
+**Automated Static Analysis & Code Quality Engine for GitHub**
 
 ---
 
-### Step 1: Register Your GitHub App
+## 1. Executive Summary
 
-To let GitHub know your application exists and where to send events, you must register it in your account settings.
+**ReviewForge** is an asynchronous, developer-focused code review automation platform. It listens for GitHub Pull Request (PR) webhooks, executes static code analysis and linting within isolated, ephemeral Docker containers, and uses LLMs/rule engines to generate inline suggestions on specific lines of code.
 
-1. Go to your **GitHub Profile** -> **Settings** -> **Developer Settings** (at the very bottom of the left sidebar).
-2. Click on **GitHub Apps** -> **New GitHub App**.
-3. Fill out the core identification fields:
-* **GitHub App name:** `ReviewForge-Local` (or any unique name).
-* **Homepage URL:** `[https://github.com](https://github.com)` (placeholder for now).
-* **Webhook URL:** For local development, GitHub cannot send HTTP requests directly to `localhost`. You need a tunneling tool like **ngrok** to expose your local port. Run `ngrok http 8000` in your terminal, copy the generated public HTTPS URL (e.g., `[https://xxxx.ngrok-free.app](https://xxxx.ngrok-free.app)`), and append `/webhooks/github` to it: `[https://xxxx.ngrok-free.app/webhooks/github](https://xxxx.ngrok-free.app/webhooks/github)`.
-* **Webhook secret:** Generate a random secure string (e.g., using `openssl rand -hex 20` in your terminal) and save it. **This secret is used to sign webhook payloads cryptographically.**
+### Primary Resume Value Drivers
 
-
-4. Set the **Repository Permissions**:
-* **Pull requests:** `Read & write` (needed to fetch diffs and post review comments).
-* **Contents:** `Read` (needed to clone the repository code inside our Docker sandbox).
-
-
-5. Set **Subscribe to events**:
-* Check **Pull request** (this ensures GitHub fires a webhook whenever a PR is opened, synchronized, or edited).
-
-
-6. Click **Create GitHub App**.
+* **Decoupled Asynchronous Architecture:** Demonstrates mastery of event-driven design, message brokers, and queue worker patterns.
+* **Security & Isolation:** Demonstrates containerization and safe execution of untrusted code within sandboxed environments.
+* **Developer Platform Integration:** Demonstrates working with REST/GraphQL APIs, HMAC authentication, rate limiting, and webhook ingestion.
 
 ---
 
-### Step 2: Generate Credentials
+## 2. System Architecture & Data Flow
 
-Once created, you need two pieces of credentials that your FastAPI backend will use to authenticate with GitHub:
+```
++------------------+         HMAC Signature      +----------------------+
+|                  | ---------------------------> |  FastAPI Webhook     |
+|   GitHub App     |                              |     Ingress          |
+|                  | <--------------------------- |                      |
++------------------+     200 OK (Immediate)       +----------------------+
+                                                            |
+                                                            | Push Job
+                                                            v
++------------------+        Worker Poll           +----------------------+
+|                  | <--------------------------- |    Redis / Celery    |
+|   Celery Worker  |                              |     Task Queue       |
+|                  |                              +----------------------+
++------------------+
+        |
+        | 1. Spin up ephemeral container
+        v
++-------------------------------------------------+
+| Docker Sandbox Container                        |
+|   - Git Clone PR Branch                         |
+|   - Run Linters (Ruff/Flake8/ESLint)            |
+|   - Generate Structured Diff Analysis           |
++-------------------------------------------------+
+        |
+        | 2. Aggregate & Map Output to Diff Lines
+        v
++------------------+        Post Inline           +----------------------+
+|  Review Service  | ---------------------------> | GitHub REST/GraphQL  |
+|                  |          Comments            |        API           |
++------------------+                              +----------------------+
 
-1. **App ID:** Found at the top of your newly created GitHub App settings page.
-2. **Private Key:** Scroll down to the "Private keys" section and click **Generate a private key**. This downloads a `.pem` file. Move this file into your project directory (and ensure it is added to your `.gitignore` so you never commit credentials to GitHub).
+```
 
 ---
 
-### Step 3: Expose Localhost via ngrok (The Logic)
+## 3. Functional Requirements
 
-When GitHub sends a webhook, it makes an outgoing POST request over the internet. Your development machine sits behind a router and a firewall, meaning GitHub has no route to `127.0.0.1:8000`.
+### 3.1 Webhook Ingestion & Security
 
-**ngrok** solves this by opening a secure reverse proxy tunnel. It gives you a public URL (`*.ngrok-free.app`) that routes incoming internet traffic directly to your local machine's port 8000, allowing you to test webhooks live during development.
+* **Req 1.1 (Payload Verification):** Verify incoming GitHub Webhook requests using SHA-256 HMAC signatures (`X-Hub-Signature-256`) against a stored secret.
+* **Req 1.2 (Rapid Response):** Acknowledge incoming `pull_request` events (`opened`, `synchronize`) with an immediate `200 OK` within 200ms to prevent webhook timeouts.
+* **Req 1.3 (Job Dispatch):** Parse PR metadata (Repository ID, PR Number, Head SHA, Base Branch) and publish a structured job payload to the Redis queue.
+
+### 3.2 Task Processing & Worker Pool
+
+* **Req 2.1 (Queue Management):** Process incoming jobs asynchronously using Celery/Redis worker nodes.
+* **Req 2.2 (Deduplication):** Prevent redundant analysis runs if a rapid succession of pushes occurs on the same branch.
+
+### 3.3 Sandboxed Execution
+
+* **Req 3.1 (Isolation):** Programmatically spawn a restricted Docker container per job using the Docker SDK.
+* **Req 3.2 (Resource Limits):** Enforce strict CPU ($0.5$ cores), Memory ($512\text{ MB}$), execution timeout ($120\text{ seconds}$), and disabled network access post-clone to prevent resource exhaustion or malicious activity.
+* **Req 3.3 (Linter Runner):** Execute static analysis tools (e.g., `ruff` for Python, `eslint` for JavaScript) against only modified/added files in the git diff.
+
+### 3.4 Review Aggregation & GitHub API Feedback
+
+* **Req 4.1 (Line Mapping):** Map linter/analysis outputs strictly to valid line numbers present in the pull request diff snippet.
+* **Req 4.2 (API Commenting):** Call the GitHub GraphQL/REST API to post inline comments on specific diff lines, as well as a summary comment summarizing overall code health.
+* **Req 4.3 (Rate Limit Handling):** Implement exponential backoff and token-bucket strategies to stay within GitHub's primary and secondary API rate limits.
+
+---
+
+## 4. Technical Stack
+
+| Layer | Technology Choice |
+| --- | --- |
+| **Language** | Python 3.11+ |
+| **API Framework** | FastAPI |
+| **Message Queue / Broker** | Redis + Celery |
+| **Sandboxing & Compute** | Docker (via Python `docker` SDK) |
+| **External Integration** | GitHub REST API v3 / GraphQL API |
+| **Development Tunneling** | `ngrok` or `localtunnel` (for testing webhooks locally) |
+
+---
+
+## 5. Development Roadmap & Implementation Steps
+
+### Phase 1: Ingestion & Webhook Infrastructure
+
+1. Create a GitHub App in GitHub Developer Settings with `Pull Requests: Read & Write` permissions.
+2. Build a FastAPI app with a POST `/webhooks/github` route.
+3. Add HMAC cryptographic signature validation.
+4. Set up `ngrok` to forward GitHub payloads to `localhost:8000`.
+
+### Phase 2: Asynchronous Processing & Queue
+
+1. Spin up a local Redis instance via Docker (`docker run -p 6379:6379 redis`).
+2. Initialize Celery worker task definitions in Python.
+3. Configure FastAPI to dispatch webhook payloads directly to Celery task queues.
+
+### Phase 3: Docker Sandbox Execution
+
+1. Write a Python worker task that receives a repo URL and commit SHA.
+2. Use the Docker SDK (`docker.from_env()`) to spin up a container with `git` and linter tools pre-installed.
+3. Mount a temporary volume, clone the branch, run static analysis tools, and parse raw outputs into structured JSON.
+
+### Phase 4: GitHub API Integration & Inline Commenting
+
+1. Obtain an Installation Access Token from the GitHub App JWT key.
+2. Parse the git diff to identify modified line numbers.
+3. Send POST requests to `/repos/{owner}/{repo}/pulls/{pull_number}/reviews` to submit inline suggestions and review status (`APPROVE` vs `REQUEST_CHANGES`).
+
+---
